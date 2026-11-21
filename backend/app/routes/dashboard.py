@@ -233,3 +233,4 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         "recent_pull_requests": recent_pr_data,
         "recent_fixes": recent_fix_data,
     }
+#dashboard sumary file
