@@ -1,0 +1,1344 @@
+﻿===== MAIN.PY =====
+
+import logging
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+
+from app.database.connection import engine, Base
+from app.database import models
+
+from app.routes.repositories import router as repository_router
+from app.routes.github import router as github_router
+from app.routes.reviews import router as reviews_router
+from app.routes.fixes import router as fixes_router
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Initialize database tables
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables initialized successfully.")
+
+except Exception:
+    logger.exception("Database table initialization failed.")
+    raise
+
+
+# Create FastAPI application
+app = FastAPI(
+    title="AI Code Review Agent",
+    description="Automated AI-powered code review system",
+    version="1.0.0",
+)
+
+
+# Register API routers
+app.include_router(repository_router)
+app.include_router(github_router)
+app.include_router(reviews_router)
+app.include_router(fixes_router)
+
+
+# Configure frontend connection
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("AI Code Review Agent started successfully.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("AI Code Review Agent is shutting down.")
+
+
+@app.get("/")
+def home():
+    logger.info("Home endpoint accessed.")
+
+    return {
+        "message": "Welcome to AI Code Review Agent",
+        "status": "Running",
+    }
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "application": "AI Code Review Agent",
+    }
+
+
+@app.get("/health/db")
+def database_health():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        logger.info("Database health check successful.")
+
+        return {
+            "status": "success",
+            "database": "PostgreSQL",
+            "message": "Database connection successful",
+        }
+
+    except Exception:
+        logger.exception("Database health check failed.")
+
+        return {
+            "status": "error",
+            "message": "Database connection failed",
+        }
+===== DATABASE MODELS =====
+
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import (
+    String,
+    Integer,
+    Text,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint,
+    JSON,
+    Boolean,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.database.connection import Base
+
+
+# 1. GitHub repositories
+class Repository(Base):
+    __tablename__ = "repositories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    github_repo_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    html_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    pull_requests: Mapped[list["PullRequest"]] = relationship(back_populates="repository")
+
+
+# 2. GitHub pull requests
+class PullRequest(Base):
+    __tablename__ = "pull_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id"), nullable=False)
+    github_pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="open")
+    head_sha: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    repository: Mapped["Repository"] = relationship(back_populates="pull_requests")
+    reviews: Mapped[list["Review"]] = relationship(back_populates="pull_request")
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "github_pr_number", name="uq_repository_pr_number"),
+    )
+
+
+# 3. AI code reviews
+class Review(Base):
+    __tablename__ = "reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    pull_request_id: Mapped[int] = mapped_column(ForeignKey("pull_requests.id"), nullable=False)
+    commit_sha: Mapped[str] = mapped_column(String(100), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    overall_status: Mapped[str] = mapped_column(String(50), default="completed")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    pull_request: Mapped["PullRequest"] = relationship(back_populates="reviews")
+    issues: Mapped[list["ReviewIssue"]] = relationship(
+        back_populates="review", cascade="all, delete-orphan"
+    )
+    files: Mapped[list["ReviewFile"]] = relationship(
+        back_populates="review", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("pull_request_id", "commit_sha", name="uq_review_pr_commit"),
+    )
+
+
+# 4. Individual review findings
+class ReviewIssue(Base):
+    __tablename__ = "review_issues"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("reviews.id"), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    line_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    issue_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    severity: Mapped[str] = mapped_column(String(50), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    suggestion: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(50), default="ai")
+
+    review: Mapped["Review"] = relationship(back_populates="issues")
+
+
+# 5. GitHub webhook delivery tracking
+class WebhookEvent(Base):
+    __tablename__ = "webhook_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    delivery_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    action: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    repository_full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="received")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("delivery_id", name="uq_webhook_delivery_id"),
+    )
+
+
+# 6. Files analyzed during a code review
+class ReviewFile(Base):
+    __tablename__ = "review_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("reviews.id"), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    additions_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    deletions_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    changes_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    added_lines: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    deleted_lines: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    patch_available: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    review: Mapped["Review"] = relationship(back_populates="files")
+
+    __table_args__ = (
+        UniqueConstraint("review_id", "file_path", name="uq_review_file_path"),
+    )
+
+
+# 7. AI-generated fix proposals
+class FixProposal(Base):
+    __tablename__ = "fix_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    repository_full_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    original_pr_number: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    original_commit_sha: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    original_code: Mapped[str] = mapped_column(Text, nullable=False)
+    fixed_code: Mapped[str] = mapped_column(Text, nullable=False)
+    changes_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    test_result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="pending_approval", index=True
+    )
+    github_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+===== REPOSITORY ROUTES =====
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database.connection import get_db
+from app.database.models import Repository
+from app.schemas.repository_schema import (
+    RepositoryCreate,
+    RepositoryResponse
+)
+
+router = APIRouter(
+    prefix="/repositories",
+    tags=["Repositories"]
+)
+
+
+# Register a GitHub repository
+@router.post(
+    "/",
+    response_model=RepositoryResponse,
+    status_code=status.HTTP_201_CREATED
+)
+def create_repository(
+    repository: RepositoryCreate,
+    db: Session = Depends(get_db)
+):
+    # Check whether the repository already exists
+    existing_repository = db.query(Repository).filter(
+        (Repository.github_repo_id == repository.github_repo_id) |
+        (Repository.full_name == repository.full_name)
+    ).first()
+
+    if existing_repository:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Repository already registered"
+        )
+
+    # Create a new repository record
+    new_repository = Repository(
+        github_repo_id=repository.github_repo_id,
+        name=repository.name,
+        full_name=repository.full_name,
+        html_url=repository.html_url
+    )
+
+    try:
+        db.add(new_repository)
+        db.commit()
+        db.refresh(new_repository)
+
+        return new_repository
+
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to save repository"
+        )
+
+
+# Get all registered repositories
+@router.get(
+    "/",
+    response_model=list[RepositoryResponse]
+)
+def get_repositories(db: Session = Depends(get_db)):
+    repositories = db.query(Repository).all()
+    return repositories
+
+
+# Get one repository by its database ID
+@router.get(
+    "/{repository_id}",
+    response_model=RepositoryResponse
+)
+def get_repository(
+    repository_id: int,
+    db: Session = Depends(get_db)
+):
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id
+    ).first()
+
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found"
+        )
+
+    return repository
+===== REVIEW ROUTES =====
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session, selectinload
+
+from app.database.connection import get_db
+from app.database.models import Review, PullRequest
+from app.schemas.review_schema import (
+    ReviewResponse,
+    PullRequestReviewResponse,
+)
+
+# Create the router
+router = APIRouter(
+    prefix="/reviews",
+    tags=["Code Reviews"],
+)
+
+
+# 1. Retrieve all saved reviews
+@router.get("/", response_model=list[ReviewResponse])
+def get_all_reviews(db: Session = Depends(get_db)):
+
+    reviews = (
+        db.query(Review)
+        .options(
+            selectinload(Review.files),
+            selectinload(Review.issues),
+        )
+        .order_by(Review.created_at.desc())
+        .all()
+    )
+
+    return reviews
+
+
+# 2. Retrieve one review by ID
+@router.get("/{review_id}", response_model=ReviewResponse)
+def get_review_by_id(
+    review_id: int,
+    db: Session = Depends(get_db),
+):
+
+    review = (
+        db.query(Review)
+        .options(
+            selectinload(Review.files),
+            selectinload(Review.issues),
+        )
+        .filter(Review.id == review_id)
+        .first()
+    )
+
+    if review is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Review not found",
+        )
+
+    return review
+
+
+# 3. Retrieve reviews for a Pull Request
+@router.get(
+    "/pull-request/{pr_number}",
+    response_model=list[PullRequestReviewResponse],
+)
+def get_reviews_by_pull_request(
+    pr_number: int,
+    db: Session = Depends(get_db),
+):
+
+    pull_request = (
+        db.query(PullRequest)
+        .options(
+            selectinload(PullRequest.reviews).selectinload(Review.files),
+            selectinload(PullRequest.reviews).selectinload(Review.issues),
+        )
+        .filter(PullRequest.github_pr_number == pr_number)
+        .first()
+    )
+
+    if pull_request is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Pull Request not found",
+        )
+
+    return [pull_request]
+===== FIX ROUTES =====
+
+import hmac
+import logging
+import os
+
+from datetime import datetime, timezone
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException
+)
+
+from sqlalchemy.orm import Session
+
+from app.database.connection import get_db
+from app.database.models import FixProposal
+
+from app.github.github_fix_service import (
+    create_fix_pull_request
+)
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/fixes",
+    tags=["AI Fixes"]
+)
+
+
+# 1. Verify developer approval token
+
+
+def require_fix_approval_token(
+    authorization: str | None = Header(
+        default=None,
+        alias="X-Fix-Approval-Token"
+    )
+):
+    expected = os.getenv("FIX_APPROVAL_TOKEN")
+
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Fix approval is not configured"
+        )
+
+    scheme, separator, supplied = (
+        (authorization or "").partition(" ")
+    )
+
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not supplied
+        or not hmac.compare_digest(supplied.strip(), expected.strip())
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid approval credentials"
+        )
+
+    return True
+
+
+
+# 2. Prepare proposal response
+
+def proposal_payload(
+    proposal: FixProposal,
+    include_code: bool = False
+):
+
+    payload = {
+        "id": proposal.id,
+        "status": proposal.status,
+        "repository_full_name": proposal.repository_full_name,
+        "original_pr_number": proposal.original_pr_number,
+        "original_commit_sha": proposal.original_commit_sha,
+        "filename": proposal.filename,
+        "changes_summary": proposal.changes_summary,
+        "validation": proposal.validation_result,
+        "automated_tests": proposal.test_result,
+        "github": proposal.github_result,
+        "created_at": proposal.created_at,
+        "updated_at": proposal.updated_at,
+        "approved_at": proposal.approved_at,
+        "rejected_at": proposal.rejected_at,
+        "published_at": proposal.published_at
+    }
+
+    if include_code:
+        payload["original_code"] = proposal.original_code
+        payload["fixed_code"] = proposal.fixed_code
+
+    return payload
+
+
+# 3. Preview a fix proposal
+
+@router.get("/{fix_id}")
+def get_fix_proposal(
+    fix_id: int,
+    _authorized: bool = Depends(
+        require_fix_approval_token
+    ),
+    db: Session = Depends(get_db)
+):
+
+    proposal = (
+        db.query(FixProposal)
+        .filter(FixProposal.id == fix_id)
+        .first()
+    )
+
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fix proposal not found"
+        )
+
+    return proposal_payload(
+        proposal,
+        include_code=True
+    )
+
+
+# 4. Approve and publish a fix proposal
+
+@router.post("/{fix_id}/approve")
+def approve_fix_proposal(
+    fix_id: int,
+    _authorized: bool = Depends(
+        require_fix_approval_token
+    ),
+    db: Session = Depends(get_db)
+):
+
+    proposal = (
+        db.query(FixProposal)
+        .filter(FixProposal.id == fix_id)
+        .with_for_update()
+        .first()
+    )
+
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fix proposal not found"
+        )
+
+    if proposal.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Fix proposal cannot be approved from status "
+                f"'{proposal.status}'"
+            )
+        )
+
+    # Change status before contacting GitHub.
+    # This prevents a second request from publishing it again.
+    proposal.status = "publishing"
+    proposal.approved_at = datetime.now(timezone.utc)
+    proposal.error_message = None
+
+    db.commit()
+    db.refresh(proposal)
+
+    try:
+
+        github_result = create_fix_pull_request(
+            repository_full_name=proposal.repository_full_name,
+            original_pr_number=proposal.original_pr_number,
+            filename=proposal.filename,
+            fixed_code=proposal.fixed_code,
+            changes_summary=proposal.changes_summary,
+            expected_head_sha=proposal.original_commit_sha
+        )
+
+    except ValueError as error:
+
+        message = str(error).lower()
+
+        is_stale = (
+            "changed" in message
+            or "sha" in message
+            or "commit" in message
+        )
+
+        proposal.status = (
+            "stale" if is_stale else "publish_failed"
+        )
+
+        proposal.error_message = (
+            "The original Pull Request changed after "
+            "this fix was generated."
+            if is_stale
+            else "GitHub rejected the approved fix publication."
+        )
+
+        db.commit()
+
+        logger.warning(
+            "Fix proposal %s could not be published: %s",
+            fix_id,
+            error
+        )
+
+        raise HTTPException(
+            status_code=409 if is_stale else 502,
+            detail=proposal.error_message
+        ) from error
+
+    except Exception as error:
+
+        proposal.status = "publish_failed"
+
+        proposal.error_message = (
+            "An unexpected error occurred while publishing "
+            "the approved fix."
+        )
+
+        db.commit()
+
+        logger.exception(
+            "Unexpected GitHub publishing error for fix proposal %s",
+            fix_id
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="The approved fix could not be published"
+        ) from error
+
+    proposal.status = "published"
+    proposal.github_result = github_result
+    proposal.published_at = datetime.now(timezone.utc)
+    proposal.error_message = None
+
+    db.commit()
+    db.refresh(proposal)
+
+    return proposal_payload(proposal)
+
+
+# 5. Reject a fix proposal
+
+@router.post("/{fix_id}/reject")
+def reject_fix_proposal(
+    fix_id: int,
+    _authorized: bool = Depends(
+        require_fix_approval_token
+    ),
+    db: Session = Depends(get_db)
+):
+
+    proposal = (
+        db.query(FixProposal)
+        .filter(FixProposal.id == fix_id)
+        .with_for_update()
+        .first()
+    )
+
+    if proposal is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Fix proposal not found"
+        )
+
+    if proposal.status != "pending_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Fix proposal cannot be rejected from status "
+                f"'{proposal.status}'"
+            )
+        )
+
+    proposal.status = "rejected"
+    proposal.rejected_at = datetime.now(timezone.utc)
+
+    db.commit()
+    db.refresh(proposal)
+
+    return proposal_payload(proposal)
+===== GITHUB ROUTES =====
+
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+
+from app.github.webhook_security import verify_webhook_signature
+from app.database.connection import get_db
+from app.database.models import WebhookEvent, FixProposal
+from app.services.review_storage_service import save_review_results
+from app.services.webhook_review_service import (
+    process_pull_request_review,
+    process_tracked_pull_request_review,
+)
+from app.github.github_service import (
+    verify_github_app,
+    get_repository_details,
+    get_pull_request_details,
+    get_pull_request_file_content,
+)
+from app.services.static_analyzer import analyze_python_code
+from app.services.ai_review_service import review_python_code
+from app.services.fix_workflow_service import run_fix_workflow
+
+
+router = APIRouter(
+    prefix="/github",
+    tags=["GitHub Integration"],
+)
+
+
+class FixRequest(BaseModel):
+    filename: str = Field(min_length=1)
+    test_code: str = Field(min_length=1)
+
+
+@router.get("/verify")
+def verify_github():
+    try:
+        return verify_github_app()
+    except Exception as error:
+        print("GitHub verification error:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="GitHub authentication failed",
+        )
+
+
+@router.get("/repository")
+def get_repository():
+    try:
+        return get_repository_details()
+    except Exception as error:
+        print("Repository error:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve repository",
+        )
+
+
+@router.get("/pull-request/{pr_number}")
+def get_pull_request(pr_number: int):
+    try:
+        return get_pull_request_details(pr_number)
+    except Exception as error:
+        print("Pull Request error:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve Pull Request details",
+        )
+
+
+@router.get("/pull-request/{pr_number}/static-analysis")
+def static_analysis_pull_request(pr_number: int):
+    try:
+        pr_data = get_pull_request_details(pr_number)
+        static_results = []
+
+        for file in pr_data["changed_files"]:
+            filename = file["filename"]
+
+            if not filename.endswith(".py") or file["status"] == "removed":
+                continue
+
+            code = get_pull_request_file_content(
+                pr_number,
+                filename,
+                commit_sha=pr_data["head_sha"],
+            )
+
+            analysis = analyze_python_code(code)
+
+            static_results.append({
+                "filename": filename,
+                "analysis": analysis,
+            })
+
+        return {
+            "status": "success",
+            "pull_request_number": pr_number,
+            "static_analysis": static_results,
+        }
+
+    except Exception as error:
+        print("Static analysis error:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to perform static analysis",
+        )
+
+
+@router.get("/pull-request/{pr_number}/ai-review")
+def ai_review_pull_request(
+    pr_number: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        pr_data = get_pull_request_details(pr_number)
+        review_results = []
+
+        for file in pr_data["changed_files"]:
+            filename = file["filename"]
+
+            if not filename.endswith(".py") or file["status"] == "removed":
+                continue
+
+            code = get_pull_request_file_content(
+                pr_number,
+                filename,
+                commit_sha=pr_data["head_sha"],
+            )
+
+            static_analysis = analyze_python_code(code)
+
+            ai_review = review_python_code(
+                code=code,
+                filename=filename,
+                static_analysis=static_analysis,
+            )
+
+            review_results.append({
+                "filename": filename,
+                "static_analysis": static_analysis,
+                "ai_review": ai_review,
+            })
+
+        database_result = save_review_results(
+            db=db,
+            github_repo_id=pr_data["repository_id"],
+            repository_name=pr_data["repository_name"],
+            repository_full_name=pr_data["repository_full_name"],
+            repository_url=pr_data["repository_url"],
+            pr_number=pr_data["pull_request_number"],
+            pr_title=pr_data["title"],
+            pr_description=pr_data["description"],
+            pr_status=pr_data["state"],
+            commit_sha=pr_data["head_sha"],
+            review_results=review_results,
+        )
+
+        return {
+            "status": "success",
+            "pull_request_number": pr_number,
+            "total_files_reviewed": len(review_results),
+            "reviews": review_results,
+            "database_storage": database_result,
+        }
+
+    except Exception as error:
+        db.rollback()
+        print("AI review and database storage error:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to perform AI review and save results",
+        )
+
+
+@router.post("/pull-request/{pr_number}/fix")
+def fix_pull_request(
+    pr_number: int,
+    request: FixRequest,
+    db: Session = Depends(get_db),
+):
+    """Generate and validate a fix proposal. Publishing requires separate approval."""
+
+    try:
+        pr_data = get_pull_request_details(pr_number)
+
+        if pr_data["state"] != "open":
+            raise HTTPException(
+                status_code=400,
+                detail="Only open Pull Requests can be fixed.",
+            )
+
+        filename = request.filename
+
+        changed_file = next(
+            (
+                item
+                for item in pr_data["changed_files"]
+                if item["filename"] == filename
+            ),
+            None,
+        )
+
+        if changed_file is None:
+            raise HTTPException(
+                status_code=400,
+                detail="The requested file is not part of this Pull Request.",
+            )
+
+        if changed_file["status"] == "removed":
+            raise HTTPException(
+                status_code=400,
+                detail="Deleted files cannot be fixed by this endpoint.",
+            )
+
+        if not filename.endswith(".py"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only Python files are supported currently.",
+            )
+
+        original_commit_sha = pr_data.get("head_sha")
+
+        if not original_commit_sha:
+            raise HTTPException(
+                status_code=409,
+                detail="Pull Request commit SHA is unavailable.",
+            )
+
+        # Fetch source from the exact commit being reviewed.
+        code = get_pull_request_file_content(
+            pr_number,
+            filename,
+            commit_sha=original_commit_sha,
+        )
+
+        static_analysis = analyze_python_code(code)
+
+        ai_review = review_python_code(
+            code=code,
+            filename=filename,
+            static_analysis=static_analysis,
+        )
+
+        # Generate and test the fix without publishing it.
+        fix_result = run_fix_workflow(
+            code=code,
+            filename=filename,
+            review_result=ai_review,
+            test_code=request.test_code,
+            publish_to_github=False,
+        )
+
+        if fix_result.get("status") != "passed":
+            return {
+                "status": fix_result.get("status", "fix_failed"),
+                "filename": filename,
+                "message": fix_result.get("message"),
+                "changes_summary": fix_result.get("changes_summary"),
+                "validation": fix_result.get("validation"),
+                "automated_tests": fix_result.get("automated_tests"),
+                "fix_id": None,
+            }
+
+        # Check whether the PR changed during fix generation.
+        latest_pr_data = get_pull_request_details(pr_number)
+
+        if (
+            latest_pr_data.get("state") != "open"
+            or latest_pr_data.get("head_sha") != original_commit_sha
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The Pull Request changed while the fix was being generated. "
+                    "Generate a new fix proposal."
+                ),
+            )
+
+        proposal = FixProposal(
+            repository_full_name=pr_data["repository_full_name"],
+            original_pr_number=pr_number,
+            original_commit_sha=original_commit_sha,
+            filename=filename,
+            original_code=code,
+            fixed_code=fix_result["fixed_code"],
+            changes_summary=fix_result["changes_summary"],
+            validation_result=fix_result["validation"],
+            test_result=fix_result["automated_tests"],
+            status="pending_approval",
+        )
+
+        db.add(proposal)
+        db.commit()
+        db.refresh(proposal)
+
+        return {
+            "status": "pending_approval",
+            "fix_id": proposal.id,
+            "filename": filename,
+            "original_commit_sha": original_commit_sha,
+            "message": (
+                "Fix passed validation and Docker tests. "
+                "Developer approval is required before publishing."
+            ),
+            "changes_summary": proposal.changes_summary,
+            "validation": proposal.validation_result,
+            "automated_tests": proposal.test_result,
+            "preview_url": f"/fixes/{proposal.id}",
+            "approve_url": f"/fixes/{proposal.id}/approve",
+            "reject_url": f"/fixes/{proposal.id}/reject",
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        db.rollback()
+        print("AI Fix workflow error:", repr(error))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to generate and save AI fix proposal",
+        ) from error
+
+
+@router.post("/webhook")
+async def github_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    # Read the original request body.
+    payload = await request.body()
+
+    signature = request.headers.get("X-Hub-Signature-256")
+
+    # Verify GitHub webhook signature.
+    try:
+        is_valid = verify_webhook_signature(payload, signature)
+
+    except RuntimeError as error:
+        print("Webhook configuration error:", str(error))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook security is not configured",
+        )
+
+    if not is_valid:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook signature",
+        )
+
+    event_type = request.headers.get("X-GitHub-Event")
+
+    # Handle GitHub ping event.
+    if event_type == "ping":
+        return {
+            "status": "success",
+            "message": "GitHub webhook connection successful",
+        }
+
+    # Parse webhook JSON.
+    try:
+        event_data = await request.json()
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook JSON payload",
+        )
+
+    if event_type == "pull_request":
+
+        action = event_data.get("action")
+
+        supported_actions = [
+            "opened",
+            "synchronize",
+            "reopened",
+        ]
+
+        if action not in supported_actions:
+            return {
+                "status": "ignored",
+                "action": action,
+                "message": "Pull Request action is not supported",
+            }
+
+        # Read GitHub delivery ID.
+        delivery_id = request.headers.get("X-GitHub-Delivery")
+
+        if not delivery_id or not delivery_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Missing GitHub delivery ID",
+            )
+
+        repository = event_data.get("repository") or {}
+
+        repository_full_name = repository.get("full_name")
+
+        pull_request = event_data.get("pull_request") or {}
+
+        pr_number = pull_request.get("number")
+
+        installation = event_data.get("installation") or {}
+
+        installation_id = installation.get("id")
+
+        # Validate required GitHub event information.
+        if (
+            not isinstance(repository_full_name, str)
+            or not repository_full_name.strip()
+            or not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+            or not isinstance(installation_id, int)
+            or isinstance(installation_id, bool)
+            or installation_id <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Missing or invalid GitHub event information",
+            )
+
+        print("WEBHOOK DELIVERY ID:", delivery_id)
+
+        # Check whether this delivery was already recorded.
+        existing_event = (
+            db.query(WebhookEvent)
+            .filter(
+                WebhookEvent.delivery_id == delivery_id
+            )
+            .first()
+        )
+
+        event_id = None
+        is_retry = False
+
+        if existing_event:
+
+            # Only failed events can be retried.
+            if existing_event.status != "failed":
+                return {
+                    "status": "duplicate",
+                    "message": (
+                        "This GitHub webhook delivery was already received."
+                    ),
+                    "delivery_id": delivery_id,
+                    "event_status": existing_event.status,
+                }
+
+            # Atomically claim a failed event.
+            # Only one concurrent request can change
+            # the status from failed to received.
+            claimed = (
+                db.query(WebhookEvent)
+                .filter(
+                    WebhookEvent.id == existing_event.id,
+                    WebhookEvent.status == "failed",
+                )
+                .update(
+                    {"status": "received"},
+                    synchronize_session=False,
+                )
+            )
+
+            db.commit()
+
+            if claimed != 1:
+
+                current_event = (
+                    db.query(WebhookEvent)
+                    .filter(
+                        WebhookEvent.delivery_id == delivery_id
+                    )
+                    .first()
+                )
+
+                return {
+                    "status": "duplicate",
+                    "message": (
+                        "This webhook delivery is already being processed "
+                        "or was completed."
+                    ),
+                    "delivery_id": delivery_id,
+                    "event_status": (
+                        current_event.status
+                        if current_event
+                        else "unknown"
+                    ),
+                }
+
+            event_id = existing_event.id
+            is_retry = True
+
+        else:
+
+            # First delivery: create a new webhook event.
+            webhook_event = WebhookEvent(
+                delivery_id=delivery_id,
+                event_type=event_type,
+                action=action,
+                repository_full_name=repository_full_name,
+                pr_number=pr_number,
+                status="received",
+            )
+
+            db.add(webhook_event)
+
+            try:
+                db.commit()
+                db.refresh(webhook_event)
+
+                event_id = webhook_event.id
+
+            except IntegrityError:
+                # Another simultaneous request may have inserted
+                # the same delivery ID.
+                db.rollback()
+
+                existing_event = (
+                    db.query(WebhookEvent)
+                    .filter(
+                        WebhookEvent.delivery_id == delivery_id
+                    )
+                    .first()
+                )
+
+                if existing_event:
+                    return {
+                        "status": "duplicate",
+                        "message": (
+                            "This GitHub webhook delivery was already received."
+                        ),
+                        "delivery_id": delivery_id,
+                        "event_status": existing_event.status,
+                    }
+
+                raise HTTPException(
+                    status_code=500,
+                    detail="Unable to save webhook event",
+                )
+
+        # Schedule the review only for the request that
+        # created or successfully reclaimed the event.
+        background_tasks.add_task(
+            process_tracked_pull_request_review,
+            event_id,
+            repository_full_name,
+            pr_number,
+            installation_id,
+        )
+
+        return {
+            "status": "accepted",
+            "message": (
+                "Failed webhook delivery retry scheduled."
+                if is_retry
+                else "Pull Request received. Automatic AI review scheduled."
+            ),
+            "repository": repository_full_name,
+            "pull_request_number": pr_number,
+            "action": action,
+            "delivery_id": delivery_id,
+            "event_id": event_id,
+            "retry": is_retry,
+        }
+
+    return {
+        "status": "ignored",
+        "event": event_type,
+        "message": "Event received but no action is configured",
+    }
+===== ROUTE REGISTRATION =====
+GET,HEAD /openapi.json
+GET,HEAD /docs
+GET,HEAD /docs/oauth2-redirect
+GET,HEAD /redoc
+GET /
+GET /health
+GET /health/db
